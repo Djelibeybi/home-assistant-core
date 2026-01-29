@@ -1,4 +1,4 @@
-"""Sensors for LIFX lights."""
+"""Sensor entity for the LIFX integration."""
 
 from __future__ import annotations
 
@@ -35,25 +35,24 @@ async def async_setup_entry(
     entry: LIFXConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up LIFX sensor from config entry."""
+    """Set up LIFX sensor platform."""
     coordinator = entry.runtime_data
     async_add_entities([LIFXRssiSensor(coordinator, RSSI_SENSOR)])
 
 
 class LIFXRssiSensor(LIFXEntity, SensorEntity):
-    """LIFX RSSI sensor."""
+    """LIFX RSSI signal strength sensor."""
 
     def __init__(
         self,
         coordinator: LIFXUpdateCoordinator,
         description: SensorEntityDescription,
     ) -> None:
-        """Initialise the RSSI sensor."""
-
+        """Initialize the RSSI sensor."""
         super().__init__(coordinator)
         self.entity_description = description
-        self._attr_unique_id = f"{coordinator.serial_number}_{description.key}"
-        self._attr_native_unit_of_measurement = coordinator.rssi_uom
+        self._attr_unique_id = f"{coordinator.serial}_{description.key}"
+        self._attr_native_unit_of_measurement = coordinator.data.rssi_uom
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -64,7 +63,7 @@ class LIFXRssiSensor(LIFXEntity, SensorEntity):
     @callback
     def _async_update_attrs(self) -> None:
         """Handle coordinator updates."""
-        self._attr_native_value = self.coordinator.rssi
+        self._attr_native_value = self.coordinator.data.rssi
 
     async def async_added_to_hass(self) -> None:
         """Enable RSSI updates."""

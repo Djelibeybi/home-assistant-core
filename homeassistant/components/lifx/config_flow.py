@@ -1,18 +1,22 @@
-"""Config flow flow LIFX."""
+"""Config flow for LIFX."""
 
 from __future__ import annotations
 
-import socket
-from typing import Any, Self
+from typing import Any
 
-from aiolifx.aiolifx import Light
-from aiolifx.connection import LIFXConnection
+from lifx import (
+    Device,
+    LifxConnectionError,
+    LifxDeviceNotFoundError,
+    LifxTimeoutError,
+    LifxUnsupportedCommandError,
+)
 import voluptuous as vol
 
+from homeassistant.components import onboarding
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
-from homeassistant.const import CONF_DEVICE, CONF_HOST
+from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import callback
-from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.service_info.dhcp import DhcpServiceInfo
 from homeassistant.helpers.service_info.zeroconf import ZeroconfServiceInfo
 from homeassistant.helpers.typing import DiscoveryInfoType
@@ -20,246 +24,226 @@ from homeassistant.helpers.typing import DiscoveryInfoType
 from .const import (
     _LOGGER,
     CONF_SERIAL,
-    DEFAULT_ATTEMPTS,
+    DEVICE_RETRIES,
+    DEVICE_TIMEOUT,
     DOMAIN,
-    OVERALL_TIMEOUT,
-    TARGET_ANY,
+    LIFX_DEFAULT_PORT,
 )
-from .discovery import async_discover_devices
-from .util import (
-    async_entry_is_legacy,
-    async_get_legacy_entry,
-    async_multi_execute_lifx_with_retries,
-    formatted_serial,
-    lifx_features,
-    mac_matches_serial_number,
-)
+from .util import mac_matches_serial, normalize_serial
 
 
-class LifXConfigFlow(ConfigFlow, domain=DOMAIN):
-    """Handle a config flow for LIFX."""
+class LIFXConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Handle a LIFX config flow."""
 
-    VERSION = 1
+    VERSION = 2
 
-    host: str | None = None
-
-    def __init__(self) -> None:
-        """Initialize the config flow."""
-        self._discovered_devices: dict[str, Light] = {}
-        self._discovered_device: Light | None = None
-
-    async def async_step_dhcp(
-        self, discovery_info: DhcpServiceInfo
-    ) -> ConfigFlowResult:
-        """Handle discovery via DHCP."""
-        mac = discovery_info.macaddress
-        host = discovery_info.ip
-        hass = self.hass
-        for entry in self._async_current_entries():
-            if (
-                entry.unique_id
-                and not async_entry_is_legacy(entry)
-                and mac_matches_serial_number(mac, entry.unique_id)
-            ):
-                if entry.data[CONF_HOST] != host:
-                    hass.config_entries.async_update_entry(
-                        entry, data={**entry.data, CONF_HOST: host}
-                    )
-                    hass.async_create_task(
-                        hass.config_entries.async_reload(entry.entry_id)
-                    )
-                return self.async_abort(reason="already_configured")
-        return await self._async_handle_discovery(host)
-
-    async def async_step_homekit(
-        self, discovery_info: ZeroconfServiceInfo
-    ) -> ConfigFlowResult:
-        """Handle HomeKit discovery."""
-        return await self._async_handle_discovery(host=discovery_info.host)
-
-    async def async_step_integration_discovery(
-        self, discovery_info: DiscoveryInfoType
-    ) -> ConfigFlowResult:
-        """Handle LIFX UDP broadcast discovery."""
-        serial = discovery_info[CONF_SERIAL]
-        host = discovery_info[CONF_HOST]
-        await self.async_set_unique_id(formatted_serial(serial))
-        self._abort_if_unique_id_configured(updates={CONF_HOST: host})
-        return await self._async_handle_discovery(host, serial)
-
-    async def _async_handle_discovery(
-        self, host: str, serial: str | None = None
-    ) -> ConfigFlowResult:
-        """Handle any discovery."""
-        self._async_abort_entries_match({CONF_HOST: host})
-        self.host = host
-        if self.hass.config_entries.flow.async_has_matching_flow(self):
-            return self.async_abort(reason="already_in_progress")
-        if not (
-            device := await self._async_try_connect(
-                host, serial=serial, raise_on_progress=True
-            )
-        ):
-            return self.async_abort(reason="cannot_connect")
-        self._discovered_device = device
-        return await self.async_step_discovery_confirm()
-
-    def is_matching(self, other_flow: Self) -> bool:
-        """Return True if other_flow is matching this flow."""
-        return other_flow.host == self.host
-
-    @callback
-    def _async_discovered_pending_migration(self) -> bool:
-        """Check if a discovered device is pending migration."""
-        assert self.unique_id is not None
-        if not (legacy_entry := async_get_legacy_entry(self.hass)):
-            return False
-        device_registry = dr.async_get(self.hass)
-        existing_device = device_registry.async_get_device(
-            identifiers={(DOMAIN, self.unique_id)}
-        )
-        return bool(
-            existing_device is not None
-            and legacy_entry.entry_id in existing_device.config_entries
-        )
-
-    async def async_step_discovery_confirm(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Confirm discovery."""
-        assert self._discovered_device is not None
-        discovered = self._discovered_device
-        _LOGGER.debug(
-            "Confirming discovery of %s (%s) [%s]",
-            discovered.label,
-            discovered.group,
-            discovered.mac_addr,
-        )
-        if user_input is not None or self._async_discovered_pending_migration():
-            return self._async_create_entry_from_device(discovered)
-
-        self._abort_if_unique_id_configured(updates={CONF_HOST: discovered.ip_addr})
-        self._set_confirm_only()
-        placeholders = {
-            "label": discovered.label,
-            "group": discovered.group,
-        }
-        self.context["title_placeholders"] = placeholders
-        return self.async_show_form(
-            step_id="discovery_confirm", description_placeholders=placeholders
-        )
+    _ip: str
+    _port: int = LIFX_DEFAULT_PORT
+    _serial: str
+    _label: str = "LIFX Light"
+    _group: str = ""
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Handle the initial step."""
-        errors = {}
+        """Handle a flow initiated by the user."""
+        errors: dict[str, str] = {}
         if user_input is not None:
-            host = user_input[CONF_HOST]
-            if not host:
-                return await self.async_step_pick_device()
-            if (
-                device := await self._async_try_connect(host, raise_on_progress=False)
-            ) is None:
-                errors["base"] = "cannot_connect"
+            host = user_input.get(CONF_HOST, "")
+            port: int = user_input.get(CONF_PORT, LIFX_DEFAULT_PORT)
+            serial_input = user_input.get(CONF_SERIAL, "")
+            serial = normalize_serial(serial_input) if serial_input else None
+            if host:
+                try:
+                    return await self._async_try_connect(
+                        host, port=port, serial=serial or None, raise_on_progress=False
+                    )
+                except LifxTimeoutError:
+                    errors["base"] = "timeout_connect"
+                except (LifxConnectionError, LifxDeviceNotFoundError):
+                    errors["base"] = "cannot_connect"
+                except LifxUnsupportedCommandError:
+                    return self.async_abort(reason="invalid_device")
             else:
-                return self._async_create_entry_from_device(device)
+                return self.async_abort(reason="no_devices_found")
 
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema({vol.Optional(CONF_HOST, default=""): str}),
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_HOST): str,
+                    vol.Optional(CONF_PORT): int,
+                    vol.Optional(CONF_SERIAL): str,
+                }
+            ),
             errors=errors,
         )
 
-    async def async_step_pick_device(
-        self, user_input: dict[str, Any] | None = None
+    async def async_step_dhcp(
+        self,
+        discovery_info: DhcpServiceInfo,
     ) -> ConfigFlowResult:
-        """Handle the step to pick discovered device."""
-        if user_input is not None:
-            serial = user_input[CONF_DEVICE]
-            await self.async_set_unique_id(serial, raise_on_progress=False)
-            device_without_label = self._discovered_devices[serial]
-            device = await self._async_try_connect(
-                device_without_label.ip_addr, raise_on_progress=False
-            )
-            if not device:
-                return self.async_abort(reason="cannot_connect")
-            return self._async_create_entry_from_device(device)
+        """Handle DHCP discovery."""
+        mac = discovery_info.macaddress
+        host = discovery_info.ip
 
-        configured_serials: set[str] = set()
-        configured_hosts: set[str] = set()
+        # Try to match this MAC against known serial numbers
         for entry in self._async_current_entries():
-            if entry.unique_id and not async_entry_is_legacy(entry):
-                configured_serials.add(entry.unique_id)
-                configured_hosts.add(entry.data[CONF_HOST])
-        self._discovered_devices = {
-            # device.mac_addr is not the mac_address, its the serial number
-            device.mac_addr: device
-            for device in await async_discover_devices(self.hass)
-        }
-        devices_name = {
-            serial: f"{serial} ({device.ip_addr})"
-            for serial, device in self._discovered_devices.items()
-            if serial not in configured_serials
-            and device.ip_addr not in configured_hosts
-        }
-        # Check if there is at least one device
-        if not devices_name:
-            return self.async_abort(reason="no_devices_found")
+            if entry.unique_id and mac_matches_serial(mac, entry.unique_id):
+                if entry.data.get(CONF_HOST) != host:
+                    self.hass.config_entries.async_update_entry(
+                        entry, data={**entry.data, CONF_HOST: host}
+                    )
+                    await self.hass.config_entries.async_reload(entry.entry_id)
+                return self.async_abort(reason="already_configured")
+
+        _LOGGER.debug("DHCP discovered LIFX device at %s (mac: %s)", host, mac)
+
+        try:
+            return await self._async_try_connect(host, raise_on_progress=True)
+        except (
+            LifxConnectionError,
+            LifxDeviceNotFoundError,
+            LifxTimeoutError,
+        ):
+            return self.async_abort(reason="cannot_connect")
+        except LifxUnsupportedCommandError:
+            return self.async_abort(reason="invalid_device")
+
+    async def async_step_homekit(
+        self,
+        discovery_info: ZeroconfServiceInfo,
+    ) -> ConfigFlowResult:
+        """Handle HomeKit discovery."""
+        host = discovery_info.host
+        _LOGGER.debug("HomeKit discovered LIFX device at %s", host)
+        try:
+            return await self._async_try_connect(host, raise_on_progress=True)
+        except (
+            LifxConnectionError,
+            LifxDeviceNotFoundError,
+            LifxTimeoutError,
+        ):
+            return self.async_abort(reason="cannot_connect")
+        except LifxUnsupportedCommandError:
+            return self.async_abort(reason="invalid_device")
+
+    async def async_step_zeroconf(
+        self,
+        discovery_info: ZeroconfServiceInfo,
+    ) -> ConfigFlowResult:
+        """Handle zeroconf discovery."""
+        host = discovery_info.host
+        serial: str = str(discovery_info.properties.get("id", ""))
+        _LOGGER.debug(
+            "Zeroconf discovered LIFX device at %s (serial: %s)", host, serial
+        )
+        try:
+            return await self._async_try_connect(
+                host, serial=serial or None, raise_on_progress=True
+            )
+        except (
+            LifxConnectionError,
+            LifxDeviceNotFoundError,
+            LifxTimeoutError,
+        ):
+            return self.async_abort(reason="cannot_connect")
+        except LifxUnsupportedCommandError:
+            return self.async_abort(reason="invalid_device")
+
+    async def async_step_integration_discovery(
+        self,
+        discovery_info: DiscoveryInfoType,
+    ) -> ConfigFlowResult:
+        """Handle integration discovery."""
+        host: str = discovery_info[CONF_HOST]
+        port: int = discovery_info[CONF_PORT]
+        serial: str = discovery_info[CONF_SERIAL]
+        try:
+            return await self._async_try_connect(
+                host,
+                port=port,
+                serial=serial,
+                raise_on_progress=True,
+                auto_confirm=True,
+            )
+        except (
+            LifxConnectionError,
+            LifxDeviceNotFoundError,
+            LifxTimeoutError,
+        ):
+            return self.async_abort(reason="cannot_connect")
+        except LifxUnsupportedCommandError:
+            return self.async_abort(reason="invalid_device")
+
+    async def async_step_discovery_confirm(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Confirm discovery."""
+        if user_input is not None:
+            return self._async_create_entry()
+
+        self._set_confirm_only()
+        placeholders = {"label": self._label, "group": self._group}
+        self.context["title_placeholders"] = placeholders
         return self.async_show_form(
-            step_id="pick_device",
-            data_schema=vol.Schema({vol.Required(CONF_DEVICE): vol.In(devices_name)}),
+            step_id="discovery_confirm",
+            description_placeholders=placeholders,
         )
 
     @callback
-    def _async_create_entry_from_device(self, device: Light) -> ConfigFlowResult:
-        """Create a config entry from a smart device."""
-        self._abort_if_unique_id_configured(updates={CONF_HOST: device.ip_addr})
+    def _async_create_entry(self) -> ConfigFlowResult:
+        """Create the config entry."""
         return self.async_create_entry(
-            title=device.label,
-            data={CONF_HOST: device.ip_addr},
+            title=self._label,
+            data={
+                CONF_HOST: self._ip,
+                CONF_PORT: self._port,
+                CONF_SERIAL: self._serial,
+            },
         )
 
     async def _async_try_connect(
-        self, host: str, serial: str | None = None, raise_on_progress: bool = True
-    ) -> Light | None:
-        """Try to connect."""
-        self._async_abort_entries_match({CONF_HOST: host})
-        connection = LIFXConnection(host, TARGET_ANY)
-        try:
-            await connection.async_setup()
-        except socket.gaierror:
-            return None
-        device: Light = connection.device
-        try:
-            # get_hostfirmware required for MAC address offset
-            # get_version required for lifx_features()
-            # get_label required to log the name of the device
-            # get_group required to populate suggested areas
-            messages = await async_multi_execute_lifx_with_retries(
-                [
-                    device.get_hostfirmware,
-                    device.get_version,
-                    device.get_label,
-                    device.get_group,
-                ],
-                DEFAULT_ATTEMPTS,
-                OVERALL_TIMEOUT,
-            )
-        except TimeoutError:
-            return None
-        finally:
-            connection.async_stop()
-        if (
-            messages is None
-            or len(messages) != 4
-            or lifx_features(device)["relays"] is True
-            or device.host_firmware_version is None
-        ):
-            return None  # relays not supported
-        # device.mac_addr is not the mac_address, its the serial number
-        device.mac_addr = serial or messages[0].target_addr
+        self,
+        host: str,
+        port: int = LIFX_DEFAULT_PORT,
+        serial: str | None = None,
+        raise_on_progress: bool = True,
+        auto_confirm: bool = False,
+    ) -> ConfigFlowResult:
+        """Try to connect to a LIFX device and set up the flow."""
+        normalized_serial = normalize_serial(serial) if serial else None
+        async with await Device.connect(
+            ip=host,
+            port=port,
+            serial=normalized_serial,
+            timeout=DEVICE_TIMEOUT,
+            max_retries=DEVICE_RETRIES,
+        ) as light:
+            if type(light) is Device:
+                # Only non-light devices would be a Device here
+                return self.async_abort(reason="invalid_device")
+
+            self._label = light.state.label
+            self._ip = light.ip
+            self._port: int = light.port
+            self._serial = normalize_serial(light.serial)
+            self._group = light.state.group_name
+
         await self.async_set_unique_id(
-            formatted_serial(device.mac_addr), raise_on_progress=raise_on_progress
+            self._serial, raise_on_progress=raise_on_progress
         )
-        return device
+
+        self._abort_if_unique_id_configured(
+            updates={
+                CONF_HOST: self._ip,
+                CONF_PORT: self._port,
+                CONF_SERIAL: self._serial,
+            }
+        )
+
+        if auto_confirm or not onboarding.async_is_onboarded(self.hass):
+            return self._async_create_entry()
+
+        return await self.async_step_discovery_confirm()

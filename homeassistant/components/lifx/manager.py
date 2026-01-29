@@ -1,15 +1,23 @@
-"""Support for LIFX lights."""
+"""LIFX effects conductor and service manager."""
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from datetime import timedelta
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
-import aiolifx_effects
-from aiolifx_themes.painter import ThemePainter
-from aiolifx_themes.themes import Theme, ThemeLibrary
+from lifx import (
+    HSBK,
+    Colors,
+    Conductor,
+    EffectColorloop,
+    EffectPulse,
+    FirmwareEffect,
+    Light,
+    Theme,
+    ThemeLibrary,
+)
 import voluptuous as vol
 
 from homeassistant.components.light import (
@@ -29,18 +37,15 @@ from homeassistant.const import ATTR_MODE
 from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.target import (
-    TargetSelection,
+    TargetSelectorData,
     async_extract_referenced_entity_ids,
 )
 
 from .const import ATTR_THEME, DOMAIN
-from .coordinator import LIFXUpdateCoordinator
-from .util import convert_8_to_16, find_hsbk
+from .util import generate_hsbk
 
 if TYPE_CHECKING:
-    from aiolifx.aiolifx import Light
-
-SCAN_INTERVAL = timedelta(seconds=10)
+    from .coordinator import LIFXUpdateCoordinator
 
 SERVICE_EFFECT_COLORLOOP = "effect_colorloop"
 SERVICE_EFFECT_FLAME = "effect_flame"
@@ -66,30 +71,14 @@ ATTR_SKY_TYPE = "sky_type"
 ATTR_SPEED = "speed"
 ATTR_SPREAD = "spread"
 
-EFFECT_FLAME = "FLAME"
-EFFECT_MORPH = "MORPH"
-EFFECT_MOVE = "MOVE"
-EFFECT_OFF = "OFF"
-EFFECT_SKY = "SKY"
-
 EFFECT_FLAME_DEFAULT_SPEED = 3
-
 EFFECT_MORPH_DEFAULT_SPEED = 3
-EFFECT_MORPH_DEFAULT_THEME = "exciting"
-
 EFFECT_MOVE_DEFAULT_SPEED = 3
 EFFECT_MOVE_DEFAULT_DIRECTION = "right"
-EFFECT_MOVE_DIRECTION_RIGHT = "right"
-EFFECT_MOVE_DIRECTION_LEFT = "left"
-
-EFFECT_MOVE_DIRECTIONS = [EFFECT_MOVE_DIRECTION_LEFT, EFFECT_MOVE_DIRECTION_RIGHT]
-
 EFFECT_SKY_DEFAULT_SPEED = 50
 EFFECT_SKY_DEFAULT_SKY_TYPE = "Clouds"
 EFFECT_SKY_DEFAULT_CLOUD_SATURATION_MIN = 50
 EFFECT_SKY_DEFAULT_CLOUD_SATURATION_MAX = 180
-
-EFFECT_SKY_SKY_TYPES = ["Sunrise", "Sunset", "Clouds"]
 
 PAINT_THEME_DEFAULT_TRANSITION = 1
 
@@ -181,7 +170,7 @@ LIFX_EFFECT_MORPH_SCHEMA = cv.make_entity_service_schema(
         **LIFX_EFFECT_SCHEMA,
         ATTR_SPEED: vol.All(vol.Coerce(int), vol.Clamp(min=1, max=25)),
         vol.Exclusive(ATTR_THEME, COLOR_GROUP): vol.Optional(
-            vol.In(ThemeLibrary().themes)
+            vol.In(ThemeLibrary.list())
         ),
         vol.Exclusive(ATTR_PALETTE, COLOR_GROUP): vol.All(
             cv.ensure_list, [HSBK_SCHEMA]
@@ -193,8 +182,8 @@ LIFX_EFFECT_MOVE_SCHEMA = cv.make_entity_service_schema(
     {
         **LIFX_EFFECT_SCHEMA,
         ATTR_SPEED: vol.All(vol.Coerce(float), vol.Clamp(min=0.1, max=60)),
-        ATTR_DIRECTION: vol.In(EFFECT_MOVE_DIRECTIONS),
-        ATTR_THEME: vol.Optional(vol.In(ThemeLibrary().themes)),
+        ATTR_DIRECTION: vol.In(["left", "right"]),
+        ATTR_THEME: vol.Optional(vol.In(ThemeLibrary.list())),
     }
 )
 
@@ -202,7 +191,7 @@ LIFX_EFFECT_SKY_SCHEMA = cv.make_entity_service_schema(
     {
         **LIFX_EFFECT_SCHEMA,
         ATTR_SPEED: vol.All(vol.Coerce(int), vol.Clamp(min=1, max=86400)),
-        ATTR_SKY_TYPE: vol.In(EFFECT_SKY_SKY_TYPES),
+        ATTR_SKY_TYPE: vol.In(["Sunrise", "Sunset", "Clouds"]),
         ATTR_CLOUD_SATURATION_MIN: vol.All(vol.Coerce(int), vol.Clamp(min=0, max=255)),
         ATTR_CLOUD_SATURATION_MAX: vol.All(vol.Coerce(int), vol.Clamp(min=0, max=255)),
         ATTR_PALETTE: vol.All(cv.ensure_list, [HSBK_SCHEMA]),
@@ -214,7 +203,7 @@ LIFX_PAINT_THEME_SCHEMA = cv.make_entity_service_schema(
         **LIFX_EFFECT_SCHEMA,
         ATTR_TRANSITION: vol.All(vol.Coerce(int), vol.Clamp(min=1, max=3600)),
         vol.Exclusive(ATTR_THEME, COLOR_GROUP): vol.Optional(
-            vol.In(ThemeLibrary().themes)
+            vol.In(ThemeLibrary.list())
         ),
         vol.Exclusive(ATTR_PALETTE, COLOR_GROUP): vol.All(
             cv.ensure_list, [HSBK_SCHEMA]
@@ -235,17 +224,22 @@ SERVICES_SCHEMA = {
 
 
 class LIFXManager:
-    """Representation of all known LIFX entities."""
+    """Manage LIFX effects and services."""
 
     def __init__(self, hass: HomeAssistant) -> None:
-        """Initialize the manager."""
+        """Initialize the effects conductor."""
         self.hass = hass
-        self.effects_conductor = aiolifx_effects.Conductor(hass.loop)
-        self.entity_id_to_coordinator: dict[str, LIFXUpdateCoordinator] = {}
+        self.effects_conductor = Conductor()
+        self._entity_id_to_coordinator: dict[str, LIFXUpdateCoordinator] = {}
+
+    @property
+    def has_children(self) -> bool:
+        """Return true if there are still registered light entities."""
+        return bool(self._entity_id_to_coordinator)
 
     @callback
     def async_unload(self) -> None:
-        """Release resources."""
+        """Unload the manager."""
         for service in SERVICES_SCHEMA:
             self.hass.services.async_remove(DOMAIN, service)
 
@@ -253,24 +247,23 @@ class LIFXManager:
     def async_register_entity(
         self, entity_id: str, coordinator: LIFXUpdateCoordinator
     ) -> Callable[[], None]:
-        """Register an entity to the config entry id."""
-        self.entity_id_to_coordinator[entity_id] = coordinator
+        """Register an entity to its coordinator."""
+        self._entity_id_to_coordinator[entity_id] = coordinator
+        return partial(self.async_unregister_entity, entity_id)
 
-        @callback
-        def unregister_entity() -> None:
-            """Unregister entity when it is being destroyed."""
-            self.entity_id_to_coordinator.pop(entity_id)
-
-        return unregister_entity
+    @callback
+    def async_unregister_entity(self, entity_id: str) -> None:
+        """Unregister the entity."""
+        self._entity_id_to_coordinator.pop(entity_id, None)
 
     @callback
     def async_setup(self) -> None:
-        """Register the LIFX effects as hass service calls."""
+        """Register LIFX effects as hass services."""
 
         async def service_handler(service: ServiceCall) -> None:
             """Apply a service, i.e. start an effect."""
             referenced = async_extract_referenced_entity_ids(
-                self.hass, TargetSelection(service.data)
+                self.hass, TargetSelectorData(service.data)
             )
             all_referenced = referenced.referenced | referenced.indirectly_referenced
             if all_referenced:
@@ -282,28 +275,39 @@ class LIFXManager:
             )
 
     @staticmethod
-    def build_theme(theme_name: str = "exciting", palette: list | None = None) -> Theme:
-        """Either return the predefined theme or build one from the palette."""
+    def build_theme(
+        theme_name: str = "exciting",
+        palette: list[list[float | int]] | None = None,
+    ) -> Theme:
+        """Build a theme from a name or palette."""
         if palette is None:
-            return ThemeLibrary().get_theme(theme_name)
+            return ThemeLibrary.get(theme_name)
 
+        colors = [
+            HSBK(
+                round(color_values[0]),
+                color_values[1] / 100,
+                color_values[2] / 100,
+                round(color_values[3]),
+            )
+            for color_values in palette
+            if len(color_values) == 4
+        ]
         theme = Theme()
-        for hsbk in palette:
-            theme.add_hsbk(hsbk[0], hsbk[1], hsbk[2], hsbk[3])
+        theme.colors = colors
         return theme
 
     async def _start_effect_flame(
         self,
-        bulbs: list[Light],
+        lights: list[Light],
         coordinators: list[LIFXUpdateCoordinator],
         **kwargs: Any,
     ) -> None:
         """Start the firmware-based Flame effect."""
-
         await asyncio.gather(
             *(
                 coordinator.async_set_matrix_effect(
-                    effect=EFFECT_FLAME,
+                    effect_type=FirmwareEffect.FLAME,
                     speed=kwargs.get(ATTR_SPEED, EFFECT_FLAME_DEFAULT_SPEED),
                     power_on=kwargs.get(ATTR_POWER_ON, True),
                 )
@@ -313,26 +317,32 @@ class LIFXManager:
 
     async def _start_paint_theme(
         self,
-        bulbs: list[Light],
+        lights: list[Light],
         coordinators: list[LIFXUpdateCoordinator],
         **kwargs: Any,
     ) -> None:
-        """Paint a theme across one or more LIFX bulbs."""
+        """Paint a theme across one or more LIFX lights."""
         theme_name = kwargs.get(ATTR_THEME, "exciting")
         palette = kwargs.get(ATTR_PALETTE)
 
         theme = self.build_theme(theme_name, palette)
 
-        await ThemePainter(self.hass.loop).paint(
-            theme,
-            bulbs,
-            duration=kwargs.get(ATTR_TRANSITION, PAINT_THEME_DEFAULT_TRANSITION),
-            power_on=kwargs.get(ATTR_POWER_ON, True),
+        await asyncio.gather(
+            *(
+                coordinator.async_apply_theme(
+                    palette=theme.colors,
+                    power_on=kwargs.get(ATTR_POWER_ON, True),
+                    duration=kwargs.get(
+                        ATTR_TRANSITION, PAINT_THEME_DEFAULT_TRANSITION
+                    ),
+                )
+                for coordinator in coordinators
+            )
         )
 
     async def _start_effect_morph(
         self,
-        bulbs: list[Light],
+        lights: list[Light],
         coordinators: list[LIFXUpdateCoordinator],
         **kwargs: Any,
     ) -> None:
@@ -345,7 +355,7 @@ class LIFXManager:
         await asyncio.gather(
             *(
                 coordinator.async_set_matrix_effect(
-                    effect=EFFECT_MORPH,
+                    effect_type=FirmwareEffect.MORPH,
                     speed=kwargs.get(ATTR_SPEED, EFFECT_MORPH_DEFAULT_SPEED),
                     palette=theme.colors,
                     power_on=kwargs.get(ATTR_POWER_ON, True),
@@ -356,7 +366,7 @@ class LIFXManager:
 
     async def _start_effect_move(
         self,
-        bulbs: list[Light],
+        lights: list[Light],
         coordinators: list[LIFXUpdateCoordinator],
         **kwargs: Any,
     ) -> None:
@@ -364,7 +374,7 @@ class LIFXManager:
         await asyncio.gather(
             *(
                 coordinator.async_set_multizone_effect(
-                    effect=EFFECT_MOVE,
+                    effect_type=FirmwareEffect.MOVE,
                     speed=kwargs.get(ATTR_SPEED, EFFECT_MOVE_DEFAULT_SPEED),
                     direction=kwargs.get(ATTR_DIRECTION, EFFECT_MOVE_DEFAULT_DIRECTION),
                     theme_name=kwargs.get(ATTR_THEME),
@@ -376,66 +386,100 @@ class LIFXManager:
 
     async def _start_effect_pulse(
         self,
-        bulbs: list[Light],
+        lights: list[Light],
         coordinators: list[LIFXUpdateCoordinator],
         **kwargs: Any,
     ) -> None:
         """Start the software-based Pulse effect."""
-        effect = aiolifx_effects.EffectPulse(
+        color_attrs: set[str] = {
+            ATTR_BRIGHTNESS,
+            ATTR_BRIGHTNESS_PCT,
+            ATTR_COLOR_NAME,
+            ATTR_RGB_COLOR,
+            ATTR_XY_COLOR,
+            ATTR_HS_COLOR,
+            ATTR_COLOR_TEMP_KELVIN,
+        }
+        color: HSBK | None = (
+            generate_hsbk(Colors.WHITE_NEUTRAL, False, **kwargs)
+            if color_attrs.intersection(kwargs)
+            else None
+        )
+
+        effect = EffectPulse(
             power_on=bool(kwargs.get(ATTR_POWER_ON)),
             period=kwargs.get(ATTR_PERIOD),
             cycles=kwargs.get(ATTR_CYCLES),
-            mode=kwargs.get(ATTR_MODE),
-            hsbk=find_hsbk(self.hass, **kwargs),
+            mode=kwargs.get(ATTR_MODE, "blink"),
+            color=color,
         )
-        await self.effects_conductor.start(effect, bulbs)
+
+        await self.effects_conductor.start(effect, lights)
 
     async def _start_effect_colorloop(
         self,
-        bulbs: list[Light],
+        lights: list[Light],
         coordinators: list[LIFXUpdateCoordinator],
         **kwargs: Any,
     ) -> None:
-        """Start the software based Color Loop effect."""
-        brightness = None
-        saturation_max = None
-        saturation_min = None
+        """Start the software-based Color Loop effect."""
+        brightness: float | None = None
+        saturation_max: float | None = None
+        saturation_min: float | None = None
 
         if ATTR_BRIGHTNESS in kwargs:
-            brightness = convert_8_to_16(kwargs[ATTR_BRIGHTNESS])
+            brightness = kwargs[ATTR_BRIGHTNESS] / 255
         elif ATTR_BRIGHTNESS_PCT in kwargs:
-            brightness = convert_8_to_16(round(255 * kwargs[ATTR_BRIGHTNESS_PCT] / 100))
+            brightness = kwargs[ATTR_BRIGHTNESS_PCT] / 100
 
         if ATTR_SATURATION_MAX in kwargs:
-            saturation_max = int(kwargs[ATTR_SATURATION_MAX] / 100 * 65535)
+            saturation_max = kwargs[ATTR_SATURATION_MAX] / 100
 
         if ATTR_SATURATION_MIN in kwargs:
-            saturation_min = int(kwargs[ATTR_SATURATION_MIN] / 100 * 65535)
+            saturation_min = kwargs[ATTR_SATURATION_MIN] / 100
 
-        effect = aiolifx_effects.EffectColorloop(
+        period: float | None = kwargs.get(ATTR_PERIOD)
+        if period is None:
+            period = 60
+
+        change: float | None = kwargs.get(ATTR_CHANGE)
+        if change is None:
+            change = 20
+
+        spread: float | None = kwargs.get(ATTR_SPREAD)
+        if spread is None:
+            spread = 30
+
+        if saturation_max is None:
+            saturation_max = 1.0
+
+        if saturation_min is None:
+            saturation_min = 0.8
+
+        effect = EffectColorloop(
             power_on=bool(kwargs.get(ATTR_POWER_ON)),
-            period=kwargs.get(ATTR_PERIOD),
-            change=kwargs.get(ATTR_CHANGE),
-            spread=kwargs.get(ATTR_SPREAD),
+            period=period,
+            change=change,
+            spread=spread,
             transition=kwargs.get(ATTR_TRANSITION),
             brightness=brightness,
             saturation_max=saturation_max,
             saturation_min=saturation_min,
         )
-        await self.effects_conductor.start(effect, bulbs)
+
+        await self.effects_conductor.start(effect, lights)
 
     async def _start_effect_sky(
         self,
-        bulbs: list[Light],
+        lights: list[Light],
         coordinators: list[LIFXUpdateCoordinator],
         **kwargs: Any,
     ) -> None:
         """Start the firmware-based Sky effect."""
-        palette = kwargs.get(ATTR_PALETTE)
-        theme = Theme()
-        if palette is not None:
-            for hsbk in palette:
-                theme.add_hsbk(hsbk[0], hsbk[1], hsbk[2], hsbk[3])
+        if ATTR_PALETTE in kwargs:
+            theme = self.build_theme(palette=kwargs.get(ATTR_PALETTE))
+        else:
+            theme = None
 
         speed = kwargs.get(ATTR_SPEED, EFFECT_SKY_DEFAULT_SPEED)
         sky_type = kwargs.get(ATTR_SKY_TYPE, EFFECT_SKY_DEFAULT_SKY_TYPE)
@@ -452,12 +496,12 @@ class LIFXManager:
         await asyncio.gather(
             *(
                 coordinator.async_set_matrix_effect(
-                    effect=EFFECT_SKY,
+                    effect_type=FirmwareEffect.SKY,
                     speed=speed,
                     sky_type=sky_type,
                     cloud_saturation_min=cloud_saturation_min,
                     cloud_saturation_max=cloud_saturation_max,
-                    palette=theme.colors,
+                    palette=theme.colors if theme else None,
                 )
                 for coordinator in coordinators
             )
@@ -465,20 +509,22 @@ class LIFXManager:
 
     async def _start_effect_stop(
         self,
-        bulbs: list[Light],
+        lights: list[Light],
         coordinators: list[LIFXUpdateCoordinator],
         **kwargs: Any,
     ) -> None:
         """Stop any running software or firmware effect."""
-        await self.effects_conductor.stop(bulbs)
+        await self.effects_conductor.stop(lights)
 
         for coordinator in coordinators:
-            await coordinator.async_set_matrix_effect(effect=EFFECT_OFF, power_on=False)
+            await coordinator.async_set_matrix_effect(
+                effect_type=FirmwareEffect.OFF, power_on=False
+            )
             await coordinator.async_set_multizone_effect(
-                effect=EFFECT_OFF, power_on=False
+                effect_type=FirmwareEffect.OFF, power_on=False
             )
 
-    _effect_dispatch = {
+    _effect_dispatch: dict[str, Callable[..., Any]] = {
         SERVICE_EFFECT_COLORLOOP: _start_effect_colorloop,
         SERVICE_EFFECT_FLAME: _start_effect_flame,
         SERVICE_EFFECT_MORPH: _start_effect_morph,
@@ -493,15 +539,12 @@ class LIFXManager:
         self, entity_ids: set[str], service: str, **kwargs: Any
     ) -> None:
         """Start a light effect on entities."""
-
-        coordinators: list[LIFXUpdateCoordinator] = []
-        bulbs: list[Light] = []
-
         coordinators = [
             coordinator
-            for entity_id, coordinator in self.entity_id_to_coordinator.items()
+            for entity_id, coordinator in self._entity_id_to_coordinator.items()
             if entity_id in entity_ids
         ]
-        bulbs = [coordinator.device for coordinator in coordinators]
+        lights = [coordinator.light for coordinator in coordinators]
+
         if start_effect_func := self._effect_dispatch.get(service):
-            await start_effect_func(self, bulbs, coordinators, **kwargs)
+            await start_effect_func(self, lights, coordinators, **kwargs)

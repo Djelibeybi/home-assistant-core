@@ -1,9 +1,13 @@
-"""Const for LIFX."""
+"""Constants for the LIFX integration."""
 
 from __future__ import annotations
 
+from datetime import timedelta
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
+
+from awesomeversion import AwesomeVersion
+from lifx import HSBK, LightWaveform
 
 from homeassistant.util.hass_dict import HassKey
 
@@ -13,41 +17,48 @@ if TYPE_CHECKING:
 DOMAIN = "lifx"
 DATA_LIFX_MANAGER: HassKey[LIFXManager] = HassKey(DOMAIN)
 
-TARGET_ANY = "00:00:00:00:00:00"
+LIFX_DEFAULT_PORT = 56700
 
 DISCOVERY_INTERVAL = 10
-# The number of seconds before we will no longer accept a response
-# to a message and consider it invalid
-MESSAGE_TIMEOUT = 18
-# Disable the retries in the library since they are not spaced out
-# enough to account for WiFi and UDP dropouts
-MESSAGE_RETRIES = 1
-OVERALL_TIMEOUT = 15
-UNAVAILABLE_GRACE = 90
 
-# The number of times to retry a request message
-DEFAULT_ATTEMPTS = 5
-# The maximum time to wait for a bulb to respond to an update
-MAX_UPDATE_TIME = 90
-# The number of tries to send each request message to a bulb during an update
-MAX_ATTEMPTS_PER_UPDATE_REQUEST_MESSAGE = 5
+DISCOVERY_TIMEOUT = 45
+DEVICE_TIMEOUT = 8.0
+DEVICE_RETRIES = 4
+DEVICE_UNAVAILABLE_RETRIES = 3
+
+SCAN_INTERVAL = timedelta(seconds=10)
+
+DEFAULT_BRIGHTNESS = 0.8
+
+CEILING_UPLIGHT_SUFFIX = "_uplight"
+CEILING_DOWNLIGHT_SUFFIX = "_downlight"
 
 CONF_LABEL = "label"
 CONF_SERIAL = "serial"
 
-IDENTIFY_WAVEFORM = {
+
+class IdentifyWaveformDict(TypedDict):
+    """Type definition for IDENTIFY_WAVEFORM."""
+
+    color: HSBK
+    period: float
+    cycles: float
+    waveform: LightWaveform
+    transient: bool
+    skew_ratio: float
+
+
+IDENTIFY_WAVEFORM: IdentifyWaveformDict = {
+    "color": HSBK(hue=0, saturation=0, brightness=0, kelvin=3500),
+    "period": 1.0,
+    "cycles": 3.0,
+    "waveform": LightWaveform.SINE,
     "transient": True,
-    "color": [0, 0, 1, 3500],
-    "skew_ratio": 0,
-    "period": 1000,
-    "cycles": 3,
-    "waveform": 1,
-    "set_hue": True,
-    "set_saturation": True,
-    "set_brightness": True,
-    "set_kelvin": True,
+    "skew_ratio": 0.5,
 }
+
 IDENTIFY = "identify"
+IDENTIFY_DELAY = 3.0
 RESTART = "restart"
 
 ATTR_DURATION = "duration"
@@ -62,14 +73,15 @@ ATTR_THEME = "theme"
 
 HEV_CYCLE_STATE = "hev_cycle_state"
 INFRARED_BRIGHTNESS = "infrared_brightness"
-INFRARED_BRIGHTNESS_VALUES_MAP = {
-    0: "Disabled",
-    16383: "25%",
-    32767: "50%",
-    65535: "100%",
+INFRARED_BRIGHTNESS_VALUES_MAP: dict[float, str] = {
+    0.0: "Disabled",
+    0.25: "25%",
+    0.50: "50%",
+    1.0: "100%",
 }
 
-LIFX_CEILING_PRODUCT_IDS = {176, 177, 201, 202}
-LIFX_128ZONE_CEILING_PRODUCT_IDS = {201, 202}
+REQUEST_REFRESH_DELAY = 0.20
+
+RSSI_DBM_FW = AwesomeVersion("2.77")
 
 _LOGGER = logging.getLogger(__package__)

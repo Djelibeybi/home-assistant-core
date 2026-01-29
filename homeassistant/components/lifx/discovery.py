@@ -1,59 +1,84 @@
-"""The lifx integration discovery."""
+"""LIFX device discovery."""
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Collection, Iterable
-
-from aiolifx.aiolifx import LifxDiscovery, Light, ScanManager
+from lifx import Light, discover
 
 from homeassistant import config_entries
 from homeassistant.components import network
-from homeassistant.const import CONF_HOST
+from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import discovery_flow
 
-from .const import CONF_SERIAL, DOMAIN
+from .const import (
+    _LOGGER,
+    CONF_SERIAL,
+    DEVICE_RETRIES,
+    DEVICE_TIMEOUT,
+    DISCOVERY_TIMEOUT,
+    DOMAIN,
+)
+from .util import normalize_serial
 
-DEFAULT_TIMEOUT = 8.5
 
-
-async def async_discover_devices(hass: HomeAssistant) -> Collection[Light]:
-    """Discover lifx devices."""
-    all_lights: dict[str, Light] = {}
+async def async_discover_devices(
+    hass: HomeAssistant,
+) -> list[dict[str, str | int]]:
+    """Discover LIFX devices on all enabled networks."""
+    discovered: list[dict[str, str | int]] = []
+    existing_devices: dict[str, str] = {
+        normalize_serial(entry.data[CONF_SERIAL]): str(entry.data.get(CONF_HOST, ""))
+        for entry in hass.config_entries.async_entries(DOMAIN)
+        if CONF_SERIAL in entry.data
+    }
     broadcast_addrs = await network.async_get_ipv4_broadcast_addresses(hass)
-    discoveries = []
     for address in broadcast_addrs:
-        manager = ScanManager(str(address))
-        lifx_discovery = LifxDiscovery(hass.loop, manager, broadcast_ip=str(address))
-        discoveries.append(lifx_discovery)
-        lifx_discovery.start()
-
-    await asyncio.sleep(DEFAULT_TIMEOUT)
-    for discovery in discoveries:
-        all_lights.update(discovery.lights)
-        discovery.cleanup()
-
-    return all_lights.values()
-
-
-@callback
-def async_init_discovery_flow(hass: HomeAssistant, host: str, serial: str) -> None:
-    """Start discovery of devices."""
-    discovery_flow.async_create_flow(
-        hass,
-        DOMAIN,
-        context={"source": config_entries.SOURCE_INTEGRATION_DISCOVERY},
-        data={CONF_HOST: host, CONF_SERIAL: serial},
-    )
+        _LOGGER.debug("Discovering LIFX devices on %s", address)
+        async for light in discover(
+            timeout=DISCOVERY_TIMEOUT,
+            broadcast_address=str(address),
+            device_timeout=DEVICE_TIMEOUT,
+            max_retries=DEVICE_RETRIES,
+        ):
+            if light is not None and isinstance(light, Light):
+                serial = normalize_serial(light.serial)
+                existing_host = existing_devices.get(serial)
+                if existing_host and existing_host == light.ip:
+                    continue
+                if serial:
+                    discovered.append(
+                        {
+                            CONF_HOST: light.ip,
+                            CONF_PORT: light.port,
+                            CONF_SERIAL: serial,
+                        }
+                    )
+    return discovered
 
 
 @callback
 def async_trigger_discovery(
     hass: HomeAssistant,
-    discovered_devices: Iterable[Light],
+    discovered: list[dict[str, str | int]],
 ) -> None:
-    """Trigger config flows for discovered devices."""
-    for device in discovered_devices:
-        # device.mac_addr is not the mac_address, its the serial number
-        async_init_discovery_flow(hass, device.ip_addr, device.mac_addr)
+    """Trigger config flows for discovered LIFX devices."""
+    for device in discovered:
+        async_init_discovery_flow(
+            hass,
+            host=str(device[CONF_HOST]),
+            port=int(device[CONF_PORT]),
+            serial=str(device[CONF_SERIAL]),
+        )
+
+
+@callback
+def async_init_discovery_flow(
+    hass: HomeAssistant, host: str, port: int, serial: str
+) -> None:
+    """Start a discovery flow for a LIFX device."""
+    discovery_flow.async_create_flow(
+        hass,
+        DOMAIN,
+        context={"source": config_entries.SOURCE_INTEGRATION_DISCOVERY},
+        data={CONF_HOST: host, CONF_PORT: port, CONF_SERIAL: serial},
+    )

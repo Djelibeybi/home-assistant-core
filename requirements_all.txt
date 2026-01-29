@@ -305,18 +305,6 @@ aiokef==0.2.16
 # homeassistant.components.rehlko
 aiokem==1.0.1
 
-# homeassistant.components.lichess
-aiolichess==1.2.0
-
-# homeassistant.components.lifx
-aiolifx-effects==0.3.2
-
-# homeassistant.components.lifx
-aiolifx-themes==1.0.2
-
-# homeassistant.components.lifx
-aiolifx==1.2.1
-
 # homeassistant.components.lookin
 aiolookin==1.0.0
 
@@ -1432,6 +1420,9 @@ librouteros==3.2.0
 
 # homeassistant.components.soundtouch
 libsoundtouch==0.8
+
+# homeassistant.components.lifx
+lifx-async==5.1.0
 
 # homeassistant.components.osramlightify
 lightify==1.0.7.3

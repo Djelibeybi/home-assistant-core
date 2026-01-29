@@ -1,6 +1,8 @@
-"""Binary sensor entities for LIFX integration."""
+"""Binary sensor entity for the LIFX integration."""
 
 from __future__ import annotations
+
+from lifx import HevLightState
 
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
@@ -14,7 +16,6 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from .const import HEV_CYCLE_STATE
 from .coordinator import LIFXConfigEntry, LIFXUpdateCoordinator
 from .entity import LIFXEntity
-from .util import lifx_features
 
 HEV_CYCLE_STATE_SENSOR = BinarySensorEntityDescription(
     key=HEV_CYCLE_STATE,
@@ -29,16 +30,15 @@ async def async_setup_entry(
     entry: LIFXConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up LIFX from a config entry."""
+    """Set up LIFX binary sensor platform."""
     coordinator = entry.runtime_data
-
-    if lifx_features(coordinator.device)["hev"]:
+    if coordinator.data.state.capabilities.has_hev:
         async_add_entities(
-            [LIFXHevCycleBinarySensorEntity(coordinator, HEV_CYCLE_STATE_SENSOR)]
+            [LIFXHevCycleBinarySensor(coordinator, HEV_CYCLE_STATE_SENSOR)]
         )
 
 
-class LIFXHevCycleBinarySensorEntity(LIFXEntity, BinarySensorEntity):
+class LIFXHevCycleBinarySensor(LIFXEntity, BinarySensorEntity):
     """LIFX HEV cycle state binary sensor."""
 
     def __init__(
@@ -46,10 +46,10 @@ class LIFXHevCycleBinarySensorEntity(LIFXEntity, BinarySensorEntity):
         coordinator: LIFXUpdateCoordinator,
         description: BinarySensorEntityDescription,
     ) -> None:
-        """Initialise the sensor."""
+        """Initialize the HEV cycle binary sensor."""
         super().__init__(coordinator)
         self.entity_description = description
-        self._attr_unique_id = f"{coordinator.serial_number}_{description.key}"
+        self._attr_unique_id = f"{coordinator.serial}_{description.key}"
         self._async_update_attrs()
 
     @callback
@@ -61,4 +61,7 @@ class LIFXHevCycleBinarySensorEntity(LIFXEntity, BinarySensorEntity):
     @callback
     def _async_update_attrs(self) -> None:
         """Handle coordinator updates."""
-        self._attr_is_on = self.coordinator.async_get_hev_cycle_state()
+        if isinstance(self.coordinator.data.state, HevLightState):
+            self._attr_is_on = self.coordinator.async_get_hev_cycle_state()
+        else:
+            self._attr_is_on = None

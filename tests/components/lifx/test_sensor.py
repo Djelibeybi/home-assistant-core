@@ -7,6 +7,7 @@ from datetime import timedelta
 import pytest
 
 from homeassistant.components import lifx
+from homeassistant.components.lifx.const import CONF_SERIAL
 from homeassistant.components.sensor import SensorDeviceClass, SensorStateClass
 from homeassistant.const import (
     ATTR_DEVICE_CLASS,
@@ -38,13 +39,13 @@ from tests.common import MockConfigEntry, async_fire_time_changed
 async def test_rssi_sensor(
     hass: HomeAssistant, entity_registry: er.EntityRegistry
 ) -> None:
-    """Test LIFX RSSI sensor entity."""
-
+    """Test LIFX RSSI sensor entity with new firmware."""
     config_entry = MockConfigEntry(
         domain=lifx.DOMAIN,
         title=DEFAULT_ENTRY_TITLE,
-        data={CONF_HOST: IP_ADDRESS},
+        data={CONF_HOST: IP_ADDRESS, CONF_SERIAL: SERIAL},
         unique_id=SERIAL,
+        version=2,
     )
     config_entry.add_to_hass(hass)
     bulb = _mocked_bulb()
@@ -88,18 +89,35 @@ async def test_rssi_sensor(
     assert rssi.attributes[ATTR_DEVICE_CLASS] == SensorDeviceClass.SIGNAL_STRENGTH
     assert rssi.attributes["state_class"] == SensorStateClass.MEASUREMENT
 
+    # Trigger another coordinator update to populate RSSI via get_wifi_info
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=30))
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    rssi = hass.states.get(entity_id)
+    # The mock get_wifi_info returns signal=1e-7, which gives floor(10*log10(1e-7)+0.5) = -70
+    assert rssi.state == "-70"
+
+    # Update the mock RSSI data and trigger another coordinator refresh
+    bulb.get_wifi_info.return_value.signal = 1e-5
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=60))
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    rssi = hass.states.get(entity_id)
+    # 10*log10(1e-5) + 0.5 = -49.5, floor = -50
+    assert rssi.state == "-50"
+
 
 @pytest.mark.usefixtures("mock_discovery")
 async def test_rssi_sensor_old_firmware(
     hass: HomeAssistant, entity_registry: er.EntityRegistry
 ) -> None:
-    """Test LIFX RSSI sensor entity."""
-
+    """Test LIFX RSSI sensor entity with old firmware."""
     config_entry = MockConfigEntry(
         domain=lifx.DOMAIN,
         title=DEFAULT_ENTRY_TITLE,
-        data={CONF_HOST: IP_ADDRESS},
+        data={CONF_HOST: IP_ADDRESS, CONF_SERIAL: SERIAL},
         unique_id=SERIAL,
+        version=2,
     )
     config_entry.add_to_hass(hass)
     bulb = _mocked_bulb_old_firmware()
