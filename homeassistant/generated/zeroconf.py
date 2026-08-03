@@ -60,6 +60,10 @@ HOMEKIT = {
         "always_discover": True,
         "domain": "abode",
     },
+    "LIFX": {
+        "always_discover": True,
+        "domain": "lifx",
+    },
     "LIFX A19": {
         "always_discover": True,
         "domain": "lifx",

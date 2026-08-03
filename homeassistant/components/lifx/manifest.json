@@ -15,6 +15,7 @@
   "documentation": "https://www.home-assistant.io/integrations/lifx",
   "homekit": {
     "models": [
+      "LIFX",
       "LIFX A19",
       "LIFX A21",
       "LIFX Beam",
