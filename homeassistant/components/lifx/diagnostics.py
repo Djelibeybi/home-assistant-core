@@ -18,6 +18,7 @@ TO_REDACT = [
     "mac_address",
     "group",
     "location",
+    "network_name",
 ]
 
 
