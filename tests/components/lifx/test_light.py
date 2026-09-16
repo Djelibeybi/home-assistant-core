@@ -16,8 +16,8 @@ from lifx import (
     ThemeLibrary,
     TileEffectSkyType,
 )
+import probatio
 import pytest
-import voluptuous as vol
 
 from homeassistant.components import lifx
 from homeassistant.components.lifx import DOMAIN
@@ -1436,14 +1436,21 @@ async def test_hev_cycle_rejected_for_regular_light(hass: HomeAssistant) -> None
         )
 
 
-async def test_hev_cycle_action_is_not_offered_without_a_clean_bulb(
+async def test_hev_cycle_action_rejects_target_without_a_clean_bulb(
     hass: HomeAssistant,
 ) -> None:
-    """Test a setup without HEV LEDs anywhere does not register the action."""
+    """Test the registered action rejects a light without HEV LEDs."""
     await async_setup_lifx_entry(hass, create_mock_light())
 
     assert hass.states.get(ENTITY_ID) is not None
-    assert not hass.services.has_service(DOMAIN, "set_hev_cycle_state")
+    assert hass.services.has_service(DOMAIN, "set_hev_cycle_state")
+    with pytest.raises(ServiceValidationError, match="does not have HEV LEDs"):
+        await hass.services.async_call(
+            DOMAIN,
+            "set_hev_cycle_state",
+            {ATTR_ENTITY_ID: ENTITY_ID, ATTR_POWER: True},
+            blocking=True,
+        )
 
 
 async def test_infrared_rejected_for_light_without_infrared(
@@ -1629,7 +1636,7 @@ async def test_set_state_schema_rejects_invalid_values(
     """Test the retained set_state service schema."""
     await async_setup_lifx_entry(hass, create_mock_light())
 
-    with pytest.raises((HomeAssistantError, vol.Invalid)):
+    with pytest.raises((HomeAssistantError, probatio.Invalid)):
         await hass.services.async_call(
             DOMAIN,
             "set_state",
@@ -1708,7 +1715,7 @@ async def test_palette_bounds_match_the_documented_action(
     device = factory()
     await async_setup_lifx_entry(hass, device)
 
-    with pytest.raises(vol.Invalid):
+    with pytest.raises(probatio.Invalid):
         await hass.services.async_call(
             DOMAIN,
             service,

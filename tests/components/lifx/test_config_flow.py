@@ -261,6 +261,13 @@ async def test_dhcp_repairs_entry_for_each_serial_mac_candidate(
     hass: HomeAssistant, dhcp_mac: str
 ) -> None:
     """Test DHCP matches both MAC addresses derived from a device serial."""
+    unrelated_entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_HOST: "192.0.2.10", CONF_SERIAL: "d073d5112233"},
+        unique_id="d073d5112233",
+        version=2,
+    )
+    unrelated_entry.add_to_hass(hass)
     config_entry = MockConfigEntry(
         domain=DOMAIN,
         data={CONF_HOST: OLD_IP_ADDRESS, CONF_SERIAL: SERIAL},
@@ -274,7 +281,7 @@ async def test_dhcp_repairs_entry_for_each_serial_mac_candidate(
         patch.object(hass.config_entries, "async_schedule_reload") as mock_reload,
         patch(
             "homeassistant.components.lifx.config_flow.mac_candidates_for_serial",
-            return_value=(SERIAL, "d0:73:d5:dd:ee:cd"),
+            side_effect=[("d073d5112233",), (SERIAL, "d0:73:d5:dd:ee:cd")],
         ),
         patch(
             "homeassistant.components.lifx.config_flow.find_by_ip",
@@ -290,6 +297,7 @@ async def test_dhcp_repairs_entry_for_each_serial_mac_candidate(
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "already_configured"
     assert config_entry.data[CONF_HOST] == IP_ADDRESS
+    assert unrelated_entry.data[CONF_HOST] == "192.0.2.10"
     mock_reload.assert_called_once_with(config_entry.entry_id)
     config_entry.mock_state(hass, config_entries.ConfigEntryState.NOT_LOADED)
 
@@ -676,7 +684,9 @@ async def test_reconfigure_rejects_a_different_device(
     assert entry.data == {CONF_HOST: OLD_IP_ADDRESS, CONF_SERIAL: "d073d5aabbcc"}
 
 
-async def test_reconfigure_with_an_unreachable_host(hass: HomeAssistant) -> None:
+async def test_reconfigure_with_an_unreachable_host(
+    hass: HomeAssistant, mock_light: Light
+) -> None:
     """Test an address nothing answers at returns to the form."""
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -698,6 +708,18 @@ async def test_reconfigure_with_an_unreachable_host(hass: HomeAssistant) -> None
     assert result["step_id"] == "reconfigure"
     assert result["errors"] == {"base": "cannot_connect"}
     assert entry.data == {CONF_HOST: OLD_IP_ADDRESS, CONF_SERIAL: SERIAL}
+
+    with patch(
+        "homeassistant.components.lifx.config_flow.find_by_ip",
+        return_value=mock_light,
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_HOST: IP_ADDRESS}
+        )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.data == {CONF_HOST: IP_ADDRESS, CONF_SERIAL: SERIAL}
 
 
 async def test_manual_host_creates_version_2_entry(

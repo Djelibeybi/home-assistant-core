@@ -49,7 +49,7 @@
         'host': '**REDACTED**',
         'serial': '**REDACTED**',
       }),
-      'title': 'My Bulb',
+      'title': '**REDACTED**',
     }),
   })
 # ---
@@ -1679,7 +1679,7 @@
         'host': '**REDACTED**',
         'serial': '**REDACTED**',
       }),
-      'title': 'My Bulb',
+      'title': '**REDACTED**',
     }),
   })
 # ---
@@ -4845,7 +4845,7 @@
         'host': '**REDACTED**',
         'serial': '**REDACTED**',
       }),
-      'title': 'My Bulb',
+      'title': '**REDACTED**',
     }),
   })
 # ---
@@ -4899,7 +4899,7 @@
         'host': '**REDACTED**',
         'serial': '**REDACTED**',
       }),
-      'title': 'My Bulb',
+      'title': '**REDACTED**',
     }),
   })
 # ---
@@ -4953,7 +4953,7 @@
         'host': '**REDACTED**',
         'serial': '**REDACTED**',
       }),
-      'title': 'My Bulb',
+      'title': '**REDACTED**',
     }),
   })
 # ---
@@ -5491,7 +5491,7 @@
         'host': '**REDACTED**',
         'serial': '**REDACTED**',
       }),
-      'title': 'My Bulb',
+      'title': '**REDACTED**',
     }),
   })
 # ---
@@ -5555,7 +5555,7 @@
         'host': '**REDACTED**',
         'serial': '**REDACTED**',
       }),
-      'title': 'My Bulb',
+      'title': '**REDACTED**',
     }),
   })
 # ---
@@ -5610,7 +5610,7 @@
         'host': '**REDACTED**',
         'serial': '**REDACTED**',
       }),
-      'title': 'My Bulb',
+      'title': '**REDACTED**',
     }),
   })
 # ---
@@ -5764,7 +5764,7 @@
         'host': '**REDACTED**',
         'serial': '**REDACTED**',
       }),
-      'title': 'My Bulb',
+      'title': '**REDACTED**',
     }),
   })
 # ---
@@ -7836,7 +7836,7 @@
         'host': '**REDACTED**',
         'serial': '**REDACTED**',
       }),
-      'title': 'My Bulb',
+      'title': '**REDACTED**',
     }),
   })
 # ---
